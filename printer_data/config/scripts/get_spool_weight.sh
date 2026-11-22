@@ -3,33 +3,36 @@ REQ_WEIGHT=${1:-0}
 SPOOLMAN_URL="http://10.4.10.235:7912"
 MOONRAKER_URL="http://localhost:7125"
 
-# Helper to send G-code back to Klipper via Moonraker
-send_gcode() {
-  curl -s -X POST "$MOONRAKER_URL/printer/gcode/script" \
-    -H "Content-Type: application/json" \
-    -d "{\"script\": \"$1\"}" > /dev/null
-}
+python3 - "$REQ_WEIGHT" "$SPOOLMAN_URL" "$MOONRAKER_URL" << 'EOF'
+import sys, json, urllib.request, subprocess
 
-# Get active spool ID from Moonraker
-SPOOL_ID=$(curl -s "$MOONRAKER_URL/server/spoolman/status" | jq -r '.result.spool_id')
+req_weight = float(sys.argv[1])
+spoolman_url = sys.argv[2]
+moonraker_url = sys.argv[3]
 
-if [ "$SPOOL_ID" == "null" ] || [ -z "$SPOOL_ID" ]; then
-  echo "No active spool selected."
-  # Only abort if a print actually requested a weight check (or always abort during START_PRINT)
-  if [ "$(awk -v req="$REQ_WEIGHT" 'BEGIN { print (req > 0) ? 1 : 0 }')" -eq 1 ]; then
-    send_gcode "_ABORT_SPOOL_CHECK MSG='Print aborted: No active Spoolman spool selected.'"
-  fi
-  exit 0
-fi
+def send_gcode(cmd):
+    payload = json.dumps({"script": cmd})
+    subprocess.Popen(
+        ["curl", "-s", "-X", "POST", f"{moonraker_url}/printer/gcode/script",
+         "-H", "Content-Type: application/json", "-d", payload],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
 
-# Fetch remaining weight from Spoolman
-WEIGHT=$(curl -s "$SPOOLMAN_URL/api/v1/spool/$SPOOL_ID" | jq -r '.remaining_weight // 0')
-printf "Active Spool #%s remaining weight: %.1fg\n" "$SPOOL_ID" "$WEIGHT"
+with urllib.request.urlopen(f"{moonraker_url}/server/spoolman/status", timeout=3) as r:
+    spool_id = json.loads(r.read().decode()).get("result", {}).get("spool_id")
 
-# Compare required weight vs remaining weight
-IS_ENOUGH=$(awk -v req="$REQ_WEIGHT" -v rem="$WEIGHT" 'BEGIN { print (req <= 0 || rem >= req) ? 1 : 0 }')
+if not spool_id:
+    print("No active spool selected.")
+    if req_weight > 0:
+        send_gcode("_ABORT_SPOOL_CHECK MSG='Print aborted: No active Spoolman spool selected.'")
+    sys.exit(0)
 
-if [ "$IS_ENOUGH" -eq 0 ]; then
-  MSG=$(printf "Print aborted: Not enough filament (need %.1fg, %.1fg remaining)." "$REQ_WEIGHT" "$WEIGHT")
-  send_gcode "_ABORT_SPOOL_CHECK MSG='$MSG'"
-fi
+with urllib.request.urlopen(f"{spoolman_url}/api/v1/spool/{spool_id}", timeout=3) as r:
+    rem_weight = float(json.loads(r.read().decode()).get("remaining_weight") or 0)
+
+print(f"Active Spool #{spool_id} remaining weight: {rem_weight:.1f}g")
+
+if req_weight > 0 and rem_weight < req_weight:
+    msg = f"Print aborted: Not enough filament (need {req_weight:.1f}g, {rem_weight:.1f}g remaining)."
+    send_gcode(f"_ABORT_SPOOL_CHECK MSG='{msg}'")
+EOF
